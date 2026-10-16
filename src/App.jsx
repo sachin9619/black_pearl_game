@@ -156,6 +156,22 @@ function App() {
               </div>
             </div>
           </div>
+
+          {/* First Mate AI Speech Bubble */}
+          {gs.firstMateMessage && (
+            <div className={`first-mate-bubble ${gs.firstMateTimer < 1000 ? 'fading' : ''}`}>
+              <div className="first-mate-avatar">🦜</div>
+              <div className="first-mate-content">
+                <div className="first-mate-name">FIRST MATE</div>
+                <div className="first-mate-text">{gs.firstMateMessage}</div>
+              </div>
+            </div>
+          )}
+
+          {/* Adaptive AI Indicator */}
+          {gs.adaptiveIndicator && (
+            <div className="adaptive-indicator">⚙ AI ADAPTING…</div>
+          )}
         </div>
       )}
 
