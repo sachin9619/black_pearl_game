@@ -1,10 +1,15 @@
 // ============================================================
-// BLACK PEARL: LAST STAND — Complete Game Engine v2.0
-// NEW: Enemy cannons, power-ups, mini-map, combo, sinking anim,
-//      enemy arrows, pause, upgrade shop
+// BLACK PEARL: LAST STAND — Complete Game Engine v3.0
+// AI UPGRADE: Smart enemy AI states, adaptive difficulty,
+//             Gemini-powered First Mate companion
 // ============================================================
 
 import { playCannonFire, playHit, playExplosion, playWaveCleared, playBossWarning, playVictory, resumeAudio } from './audio.js';
+import {
+  resetAdaptive, trackShot, trackHit, trackKill, trackDamageTaken,
+  updateAdaptive, getAdaptiveMultipliers,
+} from './adaptiveAI.js';
+import { getFirstMateComment, setFirstMateCallback } from './firstMate.js';
 
 // ============================================================
 // CONSTANTS
@@ -89,6 +94,11 @@ let lastTime = 0;
 let pendingSpawns = 0;
 let oceanOffset = 0;
 let onStateChange = null;
+let firstMateMessage = '';     // current message text shown in HUD
+let firstMateTimer = 0;        // ms remaining to show message
+let adaptiveIndicator = false; // flash "AI ADAPTING" in HUD
+let adaptiveIndicatorTimer = 0;
+let lowHealthWarned = false;   // only warn once per life
 
 // ============================================================
 // UPGRADE HELPERS
@@ -277,12 +287,24 @@ function updatePlayer(dt) {
 function damagePlayer(amount) {
   if (!player) return;
   player.hp = Math.max(0, player.hp - amount);
+  trackDamageTaken(amount); // Adaptive AI
   shakeScreen(6);
+
+  // First Mate low-health warning (once per life)
+  if (!lowHealthWarned && player.hp > 0 && player.hp <= player.maxHp * 0.25) {
+    lowHealthWarned = true;
+    getFirstMateComment('lowHealth', {
+      wave: currentWave + 1, score, hp: player.hp, maxHp: player.maxHp,
+      combo: comboCount, enemyCount: enemies.filter(e => !e.sinking).length,
+    });
+  }
+
   if (player.hp <= 0) {
     spawnExplosion(player.x, player.y, 50);
     playExplosion();
     gameState = 'gameOver';
     saveHighScore();
+    getFirstMateComment('gameOver', { wave: currentWave + 1, score });
     if (onStateChange) onStateChange();
   }
 }
@@ -316,6 +338,7 @@ function fireWeapon() {
   playCannonFire();
   spawnMuzzleFlash(tip.x, tip.y, player.cannonAngle);
   shakeScreen(3);
+  trackShot(); // Adaptive AI: track accuracy
 
   for (let i = 0; i < weapon.count; i++) {
     const a = weapon.spread > 0 ? player.cannonAngle + rand(-weapon.spread, weapon.spread) : player.cannonAngle;
@@ -353,9 +376,10 @@ function updateProjectiles() {
         if (p.slow) e.slowed = 4000;
         spawnSplinters(p.x, p.y);
         playHit();
+        trackHit(); // Adaptive AI: track accuracy
         spawnFloatingText(e.x, e.y - e.radius - 10, `-${p.damage}`, '#ff4444');
         projectiles.splice(i, 1);
-        if (e.hp <= 0) destroyEnemy(j);
+        if (e.hp <= 0) { trackKill(); destroyEnemy(j); }
         break;
       }
     }
@@ -424,8 +448,17 @@ function spawnEnemy(type) {
     default: x = -60; y = rand(100, ARENA_H - 100); break;
   }
 
-  const hpMult  = 1 + currentWave * 0.1;
-  const spdMult = 1 + currentWave * 0.05;
+  const adMult = getAdaptiveMultipliers();
+  const hpMult  = (1 + currentWave * 0.1) * adMult.hpMult;
+  const spdMult = (1 + currentWave * 0.05) * adMult.speedMult;
+
+  // Determine initial AI state based on type
+  const aiStateMap = {
+    sloop:  'chase',
+    manwar: 'flank',
+    ketch:  'chase',
+    boss:   'charge',
+  };
 
   enemies.push({
     x, y,
@@ -433,7 +466,7 @@ function spawnEnemy(type) {
     hp: Math.floor(def.hp * hpMult),
     maxHp: Math.floor(def.hp * hpMult),
     speed: def.speed * spdMult,
-    damage: def.damage,
+    damage: Math.floor(def.damage * (adMult.damageMult || 1)),
     score: def.score,
     radius: def.radius,
     color: def.color,
@@ -454,6 +487,12 @@ function spawnEnemy(type) {
     sinkTimer: 0,
     sinkAngle: rand(-1, 1) * 0.5,
     alpha: 1,
+    // AI state machine
+    aiState: aiStateMap[type] || 'chase',
+    aiStateTimer: rand(2000, 4000),
+    flankDir: Math.random() < 0.5 ? 1 : -1,
+    flankOrbitAngle: Math.atan2(y - ARENA_H / 2, x - ARENA_W / 2),
+    retreatTarget: null,
   });
 }
 
@@ -472,6 +511,15 @@ function destroyEnemy(index) {
   spawnFloatingText(e.x, e.y - 30, label, color);
 
   if (comboCount >= 3) shakeScreen(4);
+
+  // First Mate reacts to big combos
+  if (comboCount === 5) {
+    getFirstMateComment('comboStreak', {
+      wave: currentWave + 1, score, combo: comboCount,
+      hp: player?.hp || 0, maxHp: player?.maxHp || 100,
+      enemyCount: enemies.filter(x => !x.sinking).length,
+    });
+  }
 
   // Sinking animation instead of instant removal
   e.sinking = true;
@@ -519,8 +567,7 @@ function updateEnemies(dt) {
 
     if (!player) continue;
 
-    const angle = angleBetween(e, player);
-    e.angle = angle;
+    // --- Slow effect ---
     let speed = e.speed * (e.slowed > 0 ? 0.5 : 1);
     if (e.slowed > 0) {
       e.slowed -= dt;
@@ -528,13 +575,172 @@ function updateEnemies(dt) {
         spawnParticle(e.x + rand(-10, 10), e.y + rand(-10, 10), 0, -0.5, 15, 3, '#4488ff');
     }
 
-    e.wobble += 0.02;
-    const wa = angle + Math.sin(e.wobble) * 0.3;
-    e.x += Math.cos(wa) * speed;
-    e.y += Math.sin(wa) * speed;
-
+    // --- AI State Timer ---
+    e.aiStateTimer -= dt;
     const d = dist(e, player);
 
+    // ============================================================
+    // SLOOP — Simple aggressor: chases, occasionally coordinates
+    // ============================================================
+    if (e.type === 'sloop') {
+      if (e.aiStateTimer <= 0) {
+        // Alternate between chase and coordinate (surround from diff angles)
+        e.aiState = e.aiState === 'chase' ? 'coordinate' : 'chase';
+        e.aiStateTimer = rand(2500, 4500);
+        if (e.aiState === 'coordinate') {
+          // Pick an approach angle offset from other sloops
+          const sloopIdx = enemies.filter(x => x.type === 'sloop' && !x.sinking).indexOf(e);
+          e.coordinateAngle = (sloopIdx / Math.max(1, enemies.filter(x => x.type === 'sloop').length)) * Math.PI * 2;
+        }
+      }
+
+      let moveAngle;
+      if (e.aiState === 'coordinate' && e.coordinateAngle !== undefined) {
+        // Approach from a spread angle
+        const targetX = player.x + Math.cos(e.coordinateAngle) * e.attackRange * 0.8;
+        const targetY = player.y + Math.sin(e.coordinateAngle) * e.attackRange * 0.8;
+        moveAngle = Math.atan2(targetY - e.y, targetX - e.x);
+      } else {
+        moveAngle = angleBetween(e, player);
+      }
+      e.angle = moveAngle;
+      e.x += Math.cos(moveAngle) * speed;
+      e.y += Math.sin(moveAngle) * speed;
+    }
+
+    // ============================================================
+    // MAN-OF-WAR — Flanker: orbits at cannon range, fires, then charges
+    // ============================================================
+    else if (e.type === 'manwar') {
+      const orbitRange = e.cannonRange * 0.75;
+
+      if (e.aiStateTimer <= 0) {
+        if (e.aiState === 'flank') {
+          e.aiState = d < 200 ? 'retreat' : 'charge';
+          e.aiStateTimer = rand(1500, 2500);
+          e.flankDir = -e.flankDir; // reverse orbit direction
+        } else if (e.aiState === 'retreat') {
+          e.aiState = 'flank';
+          e.aiStateTimer = rand(3000, 5000);
+        } else {
+          e.aiState = 'flank';
+          e.aiStateTimer = rand(3000, 5000);
+        }
+      }
+
+      if (e.aiState === 'flank') {
+        // Orbit player at cannon range
+        e.flankOrbitAngle += e.flankDir * 0.015 * (speed / e.speed + 0.5);
+        const targetX = player.x + Math.cos(e.flankOrbitAngle) * orbitRange;
+        const targetY = player.y + Math.sin(e.flankOrbitAngle) * orbitRange;
+        const toTarget = angleBetween(e, { x: targetX, y: targetY });
+        e.angle = toTarget;
+        e.x += Math.cos(toTarget) * speed * 1.1;
+        e.y += Math.sin(toTarget) * speed * 1.1;
+      } else if (e.aiState === 'retreat') {
+        // Back away from player
+        const away = angleBetween(player, e);
+        e.angle = away;
+        e.x += Math.cos(away) * speed * 1.3;
+        e.y += Math.sin(away) * speed * 1.3;
+      } else {
+        // Charge
+        const toward = angleBetween(e, player);
+        e.angle = toward;
+        e.x += Math.cos(toward) * speed * 1.4;
+        e.y += Math.sin(toward) * speed * 1.4;
+      }
+    }
+
+    // ============================================================
+    // BOMB KETCH — Sneaky: retreat when approached, then charges to explode
+    // ============================================================
+    else if (e.type === 'ketch') {
+      if (d < 150 && e.aiState !== 'charge') {
+        // Player too close — feint retreat
+        e.aiState = 'retreat';
+        e.aiStateTimer = rand(1200, 2000);
+        if (!e.retreatTarget) {
+          const awayAngle = angleBetween(player, e) + rand(-0.5, 0.5);
+          e.retreatTarget = {
+            x: e.x + Math.cos(awayAngle) * 180,
+            y: e.y + Math.sin(awayAngle) * 180,
+          };
+        }
+      } else if (e.aiStateTimer <= 0) {
+        e.aiState = 'charge';
+        e.retreatTarget = null;
+        e.aiStateTimer = rand(3000, 5000);
+      }
+
+      if (e.aiState === 'retreat' && e.retreatTarget) {
+        const toRet = angleBetween(e, e.retreatTarget);
+        e.angle = toRet;
+        e.x += Math.cos(toRet) * speed * 1.5;
+        e.y += Math.sin(toRet) * speed * 1.5;
+        if (dist(e, e.retreatTarget) < 20) e.retreatTarget = null;
+      } else {
+        const toward = angleBetween(e, player);
+        e.angle = toward;
+        e.x += Math.cos(toward) * speed * 1.2;
+        e.y += Math.sin(toward) * speed * 1.2;
+      }
+    }
+
+    // ============================================================
+    // BOSS — Three-phase: charge → orbit+fire → retreat+fire
+    // ============================================================
+    else if (e.type === 'boss') {
+      const hpPct = e.hp / e.maxHp;
+
+      if (e.aiStateTimer <= 0) {
+        if (e.aiState === 'charge') {
+          e.aiState = 'orbit';
+          e.aiStateTimer = rand(4000, 6000);
+          e.flankDir = -e.flankDir;
+        } else if (e.aiState === 'orbit') {
+          e.aiState = hpPct < 0.4 ? 'retreat' : 'charge';
+          e.aiStateTimer = rand(2000, 3500);
+        } else {
+          e.aiState = 'orbit';
+          e.aiStateTimer = rand(5000, 7000);
+        }
+      }
+
+      if (e.aiState === 'charge') {
+        // Charge at player fast
+        const toward = angleBetween(e, player);
+        e.angle = toward;
+        e.x += Math.cos(toward) * speed * 2.0;
+        e.y += Math.sin(toward) * speed * 2.0;
+      } else if (e.aiState === 'orbit') {
+        // Circle at cannon range, firing constantly
+        e.flankOrbitAngle += e.flankDir * 0.012;
+        const bossOrbit = e.cannonRange * 0.7;
+        const targetX = player.x + Math.cos(e.flankOrbitAngle) * bossOrbit;
+        const targetY = player.y + Math.sin(e.flankOrbitAngle) * bossOrbit;
+        const toTarget = angleBetween(e, { x: targetX, y: targetY });
+        e.angle = angleBetween(e, player); // always face player
+        e.x += Math.cos(toTarget) * speed * 1.5;
+        e.y += Math.sin(toTarget) * speed * 1.5;
+      } else {
+        // Retreat while firing
+        const away = angleBetween(player, e);
+        e.angle = angleBetween(e, player);
+        e.x += Math.cos(away) * speed * 1.2;
+        e.y += Math.sin(away) * speed * 1.2;
+      }
+    }
+
+    // ============================================================
+    // Clamp to arena
+    // ============================================================
+    e.x = clamp(e.x, -80, ARENA_W + 80);
+    e.y = clamp(e.y, -80, ARENA_H + 80);
+
+    // ============================================================
+    // ATTACKS
+    // ============================================================
     // Bomb ketch explosion trigger
     if (e.explodes && d < e.attackRange) {
       destroyEnemy(i); continue;
@@ -577,11 +783,13 @@ function updateEnemies(dt) {
 function startWave(waveIndex) {
   currentWave = waveIndex;
   enemyProjectiles = [];
+  resetAdaptive(); // Reset adaptive tracking per wave
 
   if (waveIndex >= WAVES.length) {
     gameState = 'victory';
     saveHighScore();
     playVictory();
+    getFirstMateComment('victory', { wave: currentWave + 1, score });
     if (onStateChange) onStateChange();
     return;
   }
@@ -592,6 +800,7 @@ function startWave(waveIndex) {
     bossWarningTimer = 3200;
     playBossWarning();
     shakeScreen(8);
+    getFirstMateComment('bossAppears', { wave: currentWave + 1, score });
     if (onStateChange) onStateChange();
     return;
   }
@@ -606,6 +815,14 @@ function startWave(waveIndex) {
       idx++;
     }
   });
+
+  // First Mate wave start comment
+  getFirstMateComment('waveStart', {
+    wave: currentWave + 1, score,
+    hp: player?.hp || 100, maxHp: player?.maxHp || 100,
+    enemyCount: waveDef.reduce((sum, w) => sum + w.count, 0),
+  });
+
   if (onStateChange) onStateChange();
 }
 
@@ -625,6 +842,7 @@ function checkWaveComplete() {
     score += 500;
     spawnFloatingText(player?.x || ARENA_W/2, (player?.y || ARENA_H/2) - 50, 'WAVE CLEARED! +500', '#ffdd00');
     playWaveCleared();
+    getFirstMateComment('waveCleared', { wave: currentWave + 1, score });
 
     // Show shop between waves (not after boss wave)
     if (currentWave < WAVES.length - 1) {
@@ -1168,6 +1386,13 @@ function update(dt) {
     updatePowerups(dt);
     updateCombo(dt);
     checkWaveComplete();
+
+    // Adaptive AI — check and adjust difficulty every 5s
+    const now = performance.now();
+    if (updateAdaptive(now)) {
+      adaptiveIndicator = true;
+      adaptiveIndicatorTimer = 2000;
+    }
   } else if (gameState === 'waveClear') {
     updatePlayer(dt);
     waveTransitionTimer -= dt;
@@ -1176,6 +1401,18 @@ function update(dt) {
     updatePlayer(dt);
     bossWarningTimer -= dt;
     if (bossWarningTimer <= 0) spawnBossWave();
+  }
+
+  // First mate message fade timer
+  if (firstMateTimer > 0) {
+    firstMateTimer -= dt;
+    if (firstMateTimer <= 0) { firstMateMessage = ''; firstMateTimer = 0; }
+  }
+
+  // Adaptive indicator timer
+  if (adaptiveIndicatorTimer > 0) {
+    adaptiveIndicatorTimer -= dt;
+    if (adaptiveIndicatorTimer <= 0) { adaptiveIndicator = false; }
   }
 
   // Particles always update
@@ -1254,6 +1491,9 @@ function draw() {
 
   // Pause overlay is handled by React — no canvas drawing needed here
 
+  // Mobile touch controls overlay
+  drawTouchControls();
+
   ctx.restore();
 }
 
@@ -1310,7 +1550,192 @@ function setupInput() {
   });
 
   canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+  // ============================================================
+  // TOUCH / MOBILE CONTROLS
+  // ============================================================
+  // Left half  = virtual joystick (move + rotate)
+  // Right half = aim & fire zone (tap = fire, drag = aim)
+
+  const touch = {
+    joystick: null,   // { id, startX, startY, curX, curY }
+    fireZone: null,   // { id, curX, curY }
+    firing: false,
+    fireInterval: null,
+  };
+
+  function getTouchPos(t) {
+    const rect = canvas.getBoundingClientRect();
+    return {
+      x: (t.clientX - rect.left) * (canvas.width  / rect.width),
+      y: (t.clientY - rect.top)  * (canvas.height / rect.height),
+    };
+  }
+
+  canvas.addEventListener('touchstart', (e) => {
+    e.preventDefault();
+    resumeAudio();
+    for (const t of e.changedTouches) {
+      const pos = getTouchPos(t);
+      if (pos.x < canvas.width * 0.5) {
+        // Left side = joystick
+        if (!touch.joystick) {
+          touch.joystick = { id: t.identifier, startX: pos.x, startY: pos.y, curX: pos.x, curY: pos.y };
+        }
+      } else {
+        // Right side = aim & fire
+        if (!touch.fireZone) {
+          touch.fireZone = { id: t.identifier, curX: pos.x, curY: pos.y };
+          // Continuous fire while holding
+          if (gameState === 'playing') {
+            fireWeapon();
+            touch.fireInterval = setInterval(() => { if (gameState === 'playing') fireWeapon(); }, 380);
+          }
+        }
+      }
+    }
+  }, { passive: false });
+
+  canvas.addEventListener('touchmove', (e) => {
+    e.preventDefault();
+    for (const t of e.changedTouches) {
+      const pos = getTouchPos(t);
+      if (touch.joystick && t.identifier === touch.joystick.id) {
+        touch.joystick.curX = pos.x;
+        touch.joystick.curY = pos.y;
+
+        // Translate joystick to key presses
+        const dx = pos.x - touch.joystick.startX;
+        const dy = pos.y - touch.joystick.startY;
+        const deadzone = 12;
+        const angle = Math.atan2(dy, dx);
+        const mag   = Math.hypot(dx, dy);
+
+        // Clear all movement keys
+        keys['w'] = keys['s'] = keys['a'] = keys['d'] = false;
+
+        if (mag > deadzone) {
+          keys['w'] = true; // always thrust when joystick active
+          // Rotate: use horizontal offset to determine turning
+          if (dx > deadzone)  keys['d'] = true;
+          if (dx < -deadzone) keys['a'] = true;
+
+          // Point player ship toward joystick direction
+          if (player) {
+            player.angle = angle;
+          }
+        }
+      }
+      if (touch.fireZone && t.identifier === touch.fireZone.id) {
+        touch.fireZone.curX = pos.x;
+        touch.fireZone.curY = pos.y;
+        // Update mouse world position for cannon aiming
+        mouse.x = pos.x;
+        mouse.y = pos.y;
+      }
+    }
+  }, { passive: false });
+
+  canvas.addEventListener('touchend', (e) => {
+    e.preventDefault();
+    for (const t of e.changedTouches) {
+      if (touch.joystick && t.identifier === touch.joystick.id) {
+        touch.joystick = null;
+        keys['w'] = keys['s'] = keys['a'] = keys['d'] = false;
+      }
+      if (touch.fireZone && t.identifier === touch.fireZone.id) {
+        touch.fireZone = null;
+        clearInterval(touch.fireInterval);
+        touch.fireInterval = null;
+      }
+    }
+  }, { passive: false });
+
+  // Expose touch state so draw() can overlay controls
+  window._touchState = touch;
 }
+
+// Draw mobile joystick overlay on canvas
+function drawTouchControls() {
+  const touch = window._touchState;
+  if (!touch || !('ontouchstart' in window)) return;
+
+  // Only draw when playing
+  if (gameState !== 'playing' && gameState !== 'bossWarning') return;
+
+  const joyR = 55; // outer radius
+  const knobR = 22;
+
+  // ---- Joystick (left) ----
+  const joyX = touch.joystick ? touch.joystick.startX : canvas.width * 0.18;
+  const joyY = touch.joystick ? touch.joystick.startY : canvas.height * 0.75;
+
+  // Outer ring
+  ctx.save();
+  ctx.globalAlpha = 0.25;
+  ctx.strokeStyle = '#ffffff';
+  ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(joyX, joyY, joyR, 0, Math.PI * 2); ctx.stroke();
+  ctx.globalAlpha = 0.1;
+  ctx.fillStyle = '#ffffff';
+  ctx.fill();
+  ctx.restore();
+
+  // Knob
+  if (touch.joystick) {
+    const dx = clamp(touch.joystick.curX - touch.joystick.startX, -joyR, joyR);
+    const dy = clamp(touch.joystick.curY - touch.joystick.startY, -joyR, joyR);
+    ctx.save();
+    ctx.globalAlpha = 0.5;
+    ctx.fillStyle = '#d4a017';
+    ctx.beginPath(); ctx.arc(joyX + dx, joyY + dy, knobR, 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = '#ffd700';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.restore();
+  } else {
+    // Static center knob
+    ctx.save();
+    ctx.globalAlpha = 0.3;
+    ctx.fillStyle = '#d4a017';
+    ctx.beginPath(); ctx.arc(joyX, joyY, knobR, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  }
+
+  // ---- Fire zone (right) ----
+  const fireX = canvas.width * 0.82;
+  const fireY = canvas.height * 0.75;
+
+  ctx.save();
+  ctx.globalAlpha = touch.fireZone ? 0.5 : 0.18;
+  ctx.fillStyle = touch.fireZone ? '#ff4444' : '#ffffff';
+  ctx.beginPath(); ctx.arc(fireX, fireY, 48, 0, Math.PI * 2); ctx.fill();
+  ctx.globalAlpha = touch.fireZone ? 0.9 : 0.3;
+  ctx.strokeStyle = touch.fireZone ? '#ff0000' : '#ffffff';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = touch.fireZone ? '#ffffff' : 'rgba(255,255,255,0.5)';
+  ctx.font = 'bold 22px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('🔥', fireX, fireY);
+  ctx.restore();
+
+  // Labels
+  ctx.save();
+  ctx.globalAlpha = 0.4;
+  ctx.fillStyle = '#ffffff';
+  ctx.font = '10px monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  ctx.fillText('MOVE', joyX, joyY + joyR + 5);
+  ctx.fillText('FIRE', fireX, fireY + 52);
+  ctx.restore();
+}
+
+
 
 // ============================================================
 // PUBLIC API
@@ -1319,6 +1744,13 @@ export function initGame(canvasEl, stateCallback) {
   canvas = canvasEl;
   ctx = canvas.getContext('2d');
   onStateChange = stateCallback;
+
+  // Wire up First Mate callback
+  setFirstMateCallback((msg) => {
+    firstMateMessage = msg;
+    firstMateTimer = 5000; // show for 5 seconds
+    if (onStateChange) onStateChange();
+  });
 
   function resize() { canvas.width = window.innerWidth; canvas.height = window.innerHeight; }
   resize();
@@ -1337,6 +1769,10 @@ export function startNewGame() {
   repairCooldown = 0; pendingSpawns = 0; screenShake = 0;
   comboCount = 0; comboTimer = 0;
   lastTime = 0;
+  lowHealthWarned = false;
+  firstMateMessage = ''; firstMateTimer = 0;
+  adaptiveIndicator = false; adaptiveIndicatorTimer = 0;
+  resetAdaptive();
   gameState = 'playing';
   camera = { x: player.x - (canvas?.width || 800) / 2, y: player.y - (canvas?.height || 600) / 2 };
   startWave(0);
@@ -1437,5 +1873,9 @@ export function getGameState() {
     enemies: enemies.filter(e => !e.sinking).length,
     comboCount,
     upgradeLevels: { ...upgradeLevels },
+    // AI systems
+    firstMateMessage,
+    firstMateTimer,
+    adaptiveIndicator,
   };
 }
